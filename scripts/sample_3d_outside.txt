@@ -1,0 +1,6 @@
+map_file=/home/kty/ros2_ws/src/mapf_visualizer_3d/scripts/arena_3d.map3d
+agents=4
+0 0 0  19 19 19
+0 19 0  19 0 19
+10 10 0  10 10 19
+19 0 0  0 19 19
