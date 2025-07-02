@@ -1,149 +1,107 @@
 import pandas as pd
 import numpy as np
 import time
-import os
 
-# CSV 파일 경로
 csv_path = '/home/kty/ros2_ws/src/mapf_visualizer_3d/scripts/result_interpolator.csv'
 
-# 데이터 로드 및 전처리
+# 데이터 로드
 load_start = time.time()
-interpolated_points = pd.read_csv(csv_path)
-position_data = interpolated_points[['agent', 'time', 'x', 'y', 'z']].to_numpy().astype(np.float32)
+df = pd.read_csv(csv_path)
+data = df[['agent', 'time', 'x', 'y', 'z']].to_numpy(np.float32)
 load_end = time.time()
 print(f"[데이터 로드] 소요 시간: {load_end - load_start:.2f}초")
 
-# 파라미터 설정
-R = 0.5
-safety_margin = 0.1
-attractive_strength = 1.0
-repulsive_strength = 2.0
+# 파라미터
+R, safety_margin = 0.5, 0.1
 repulsive_threshold = 2 * R + safety_margin
-n_replanning = 10
-alpha = 0.3
+attractive_strength, repulsive_strength = 1.0, 2.0
+n_replanning, alpha = 10, 0.3
 
-# 데이터 구조 최적화
-time_steps = np.unique(position_data[:, 1])
-agents = np.unique(position_data[:, 0])
+# 에이전트/시간 정리
+time_steps = np.unique(data[:, 1])
+agents = np.unique(data[:, 0])
+agent_ids = sorted(agents)
+n_agents, n_steps = len(agent_ids), len(time_steps)
+n_entries = n_agents * n_steps
 
-# 시간별/에이전트별 위치 매핑 생성
-time_agent_map = {}
-for t in time_steps:
-    time_mask = position_data[:, 1] == t
-    time_agent_map[t] = {
-        agent: position_data[time_mask & (position_data[:, 0] == agent), 2:5].squeeze()
-        for agent in agents
-    }
+# 시간 + 에이전트별 위치 캐시
+agent_start_goals = {
+    agent: (data[data[:, 0] == agent][0, 2:5], data[data[:, 0] == agent][-1, 2:5])
+    for agent in agent_ids
+}
+time_agent_map = {
+    t: {a: data[(data[:, 0] == a) & (data[:, 1] == t), 2:5].squeeze() for a in agent_ids}
+    for t in time_steps
+}
 
-# 시작점/목표점 사전 계산
-agent_start_goals = {}
-for agent in agents:
-    agent_mask = position_data[:, 0] == agent
-    agent_data = position_data[agent_mask]
-    agent_start_goals[agent] = (
-        agent_data[0, 2:5],  # 시작점
-        agent_data[-1, 2:5]  # 목표점
-    )
+def vectorized_repulsion(positions, threshold, strength):
+    n = positions.shape[0]
+    disp = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]  # (n, n, 3)
+    distances = np.linalg.norm(disp, axis=2)  # (n, n)
+    np.fill_diagonal(distances, np.inf)  # 자기 자신은 제외
 
-def vectorized_repulsion(current_pos, other_positions, threshold, strength):
-    """벡터화된 척력 계산 함수"""
-    displacements = current_pos - other_positions
-    distances = np.linalg.norm(displacements, axis=1, keepdims=True)
-    distances = np.clip(distances, 1e-6, None)  # 0으로 나누기 방지
-    
-    valid = distances < threshold
-    force_magnitudes = strength * (threshold - distances) / threshold * valid
-    unit_vectors = displacements / distances
-    return np.sum(unit_vectors * force_magnitudes, axis=0)
+    valid = distances < threshold  # (n, n)
+    force_magnitudes = np.zeros_like(distances)
+    force_magnitudes[valid] = strength * (threshold - distances[valid]) / threshold
+    force_magnitudes = force_magnitudes[:, :, np.newaxis]  # (n, n, 1)
 
+    distances_safe = np.where(distances == 0, 1e-6, distances)
+    unit_vectors = disp / distances_safe[:, :, np.newaxis]  # (n, n, 3)
+    unit_vectors[~valid] = 0  # ✅ 여기를 수정
+    return np.sum(unit_vectors * force_magnitudes, axis=1)  # (n, 3)
+
+# 전체 루프
 total_start = time.time()
+for rep_iter in range(n_replanning):
+    print(f"\n=== Replanning {rep_iter+1}/{n_replanning} ===")
+    modified = np.zeros((n_entries, 18), np.float32)
+    idx = 0
 
-for replan_iter in range(n_replanning):
-    print(f"\n=== Replanning Iteration {replan_iter+1} / {n_replanning} ===")
-    modified_paths = []
-    iter_start = time.time()
-    
     for t in time_steps:
         step_start = time.time()
-        current_agents = time_agent_map[t]
-        agent_ids = list(current_agents.keys())
-        positions = np.array([current_agents[a] for a in agent_ids])
-        
-        for idx, agent in enumerate(agent_ids):
-            current_pos = positions[idx]
-            start, goal = agent_start_goals[agent]
-            
-            # 투영점 계산 (벡터화)
-            line_vec = goal - start
-            line_len = np.linalg.norm(line_vec)
-            if line_len > 1e-6:
-                current_vec = current_pos - start
-                t_proj = np.dot(current_vec, line_vec) / (line_len ** 2)
-                t_proj = np.clip(t_proj, 0.0, 1.0)
-                projected_target = start + t_proj * line_vec
-            else:
-                projected_target = current_pos.copy()
-            
-            # 인력 계산
-            displacement = projected_target - current_pos
-            distance = np.linalg.norm(displacement)
-            if distance > 0:
-                attractive_force = (displacement / distance) * (attractive_strength * distance)
-            else:
-                attractive_force = np.zeros(3)
-            
-            # 척력 계산 (벡터화)
-            if len(positions) > 1:
-                other_positions = np.delete(positions, idx, axis=0)
-                repulsive_force = vectorized_repulsion(current_pos, other_positions, 
-                                                     repulsive_threshold, repulsive_strength)
-            else:
-                repulsive_force = np.zeros(3)
-            
-            # 위치 업데이트
-            new_pos = current_pos + (attractive_force + repulsive_force) * alpha
-            
-            # 결과 저장 (NumPy 배열로 최적화)
-            modified_paths.append([
-                agent, t, 
-                new_pos[0], new_pos[1], new_pos[2],
-                current_pos[0], current_pos[1], current_pos[2],
-                attractive_force[0], attractive_force[1], attractive_force[2],
-                repulsive_force[0], repulsive_force[1], repulsive_force[2],
-                np.linalg.norm(attractive_force),
-                np.linalg.norm(repulsive_force),
-                np.linalg.norm(attractive_force + repulsive_force),
-                np.linalg.norm(new_pos - current_pos)
-            ])
-        
-        step_end = time.time()
-        print(f"  [t={t}] 처리 시간: {step_end - step_start:.4f}초")
-    
-    # 데이터 구조 갱신
-    modified_arr = np.array(modified_paths, dtype=np.float32)
-    
-    # 다음 반복을 위한 데이터 업데이트
-    for t in time_steps:
-        time_mask = modified_arr[:, 1] == t
-        time_agent_map[t] = {
-            agent: modified_arr[time_mask & (modified_arr[:, 0] == agent), 2:5].squeeze()
-            for agent in agents
-        }
-    
-    iter_end = time.time()
-    print(f"재계획 반복 {replan_iter+1} 소요 시간: {iter_end - iter_start:.2f}초")
+        pos_arr = np.array([time_agent_map[t][a] for a in agent_ids], np.float32)  # (n_agents, 3)
+        rep_force = vectorized_repulsion(pos_arr, repulsive_threshold, repulsive_strength) if n_agents > 1 else np.zeros_like(pos_arr)
 
-total_end = time.time()
-print(f"\n전체 실행 시간: {total_end - total_start:.2f}초")
+        start_goals = np.array([agent_start_goals[a] for a in agent_ids], np.float32)  # (n, 2, 3)
+        line_vecs = start_goals[:, 1] - start_goals[:, 0]
+        line_len_sq = np.sum(line_vecs**2, axis=1, keepdims=True) + 1e-8
+        proj_t = np.clip(np.sum((pos_arr - start_goals[:, 0]) * line_vecs, axis=1, keepdims=True) / line_len_sq, 0, 1)
+        proj_targets = start_goals[:, 0] + proj_t * line_vecs
 
-# 결과 저장
-result_df = pd.DataFrame(modified_paths, columns=[
-    'agent', 'time', 'x', 'y', 'z',
-    'original_x', 'original_y', 'original_z',
-    'attractive_force_x', 'attractive_force_y', 'attractive_force_z',
-    'repulsive_force_x', 'repulsive_force_y', 'repulsive_force_z',
-    'attractive_magnitude', 'repulsive_magnitude',
-    'total_magnitude', 'displacement_magnitude'
-])
-result_df.to_csv('path_smoothing_detailed.csv', index=False)
-result_df[['agent', 'time', 'x', 'y', 'z']].to_csv('path_smoothing_simple.csv', index=False)
+        # 인력
+        disp_attr = proj_targets - pos_arr
+        dist_attr = np.linalg.norm(disp_attr, axis=1, keepdims=True)
+        attr_force = np.where(dist_attr > 1e-6, (disp_attr / dist_attr) * (attractive_strength * dist_attr), 0)
+
+        total_force = attr_force.squeeze() + rep_force
+        new_pos = pos_arr + alpha * total_force
+
+        # 결과 저장
+        for i, a in enumerate(agent_ids):
+            modified[idx] = [
+                a, t,
+                *new_pos[i], *pos_arr[i],
+                *attr_force[i], *rep_force[i],
+                np.linalg.norm(attr_force[i]),
+                np.linalg.norm(rep_force[i]),
+                np.linalg.norm(total_force[i]),
+                np.linalg.norm(new_pos[i] - pos_arr[i])
+            ]
+            idx += 1
+
+        time_agent_map[t] = {a: new_pos[i] for i, a in enumerate(agent_ids)}
+        print(f"  [t={t}] 처리 시간: {time.time() - step_start:.4f}초")
+
+    print(f"재계획 반복 {rep_iter+1} 완료")
+
+print(f"\n전체 실행 시간: {time.time() - total_start:.2f}초")
+
+# 저장
+cols = ['agent', 'time', 'x', 'y', 'z',
+        'original_x', 'original_y', 'original_z',
+        'attractive_force_x', 'attractive_force_y', 'attractive_force_z',
+        'repulsive_force_x', 'repulsive_force_y', 'repulsive_force_z',
+        'attractive_magnitude', 'repulsive_magnitude',
+        'total_magnitude', 'displacement_magnitude']
+pd.DataFrame(modified, columns=cols).to_csv('path_smoothing_detailed.csv', index=False)
+pd.DataFrame(modified[:, :5], columns=['agent', 'time', 'x', 'y', 'z']).to_csv('path_smoothing_simple.csv', index=False)

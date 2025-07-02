@@ -75,26 +75,26 @@ for agent_id, points in trajectories.items():
     constraint.forward_axis = 'FORWARD_Y'
     constraint.up_axis = 'UP_Z'
     
-    # 코드 마지막에 추가
-    bpy.context.scene.frame_start = 1
-    bpy.context.scene.frame_end = 250
-    bpy.context.scene.frame_set(1)  # 첫 번째 프레임으로 이동
-    
-    # 충돌 거리 임계값(단위: m)
-    collision_threshold = 0.3
+# 코드 마지막에 추가
+bpy.context.scene.frame_start = 1
+bpy.context.scene.frame_end = 250
+bpy.context.scene.frame_set(1)  # 첫 번째 프레임으로 이동
 
-    # 드론 오브젝트 리스트 (이름 패턴에 맞게 수정)
-    drones = [obj for obj in bpy.context.scene.objects if obj.name.startswith("Drone_")]
+# 충돌 거리 임계값(단위: m)
+collision_threshold = 0.3
 
-    frame_start = bpy.context.scene.frame_start
-    frame_end = bpy.context.scene.frame_end
+# 드론 오브젝트 리스트 (이름 패턴에 맞게 수정)
+drones = [obj for obj in bpy.context.scene.objects if obj.name.startswith("Drone_")]
 
-    for frame in range(frame_start, frame_end + 1):
-        bpy.context.scene.frame_set(frame)
-        for i in range(len(drones)):
-            for j in range(i + 1, len(drones)):
-                pos1 = drones[i].matrix_world.translation
-                pos2 = drones[j].matrix_world.translation
-                distance = (pos1 - pos2).length
-                if distance < collision_threshold:
-                    print(f"Frame {frame}: {drones[i].name}와 {drones[j].name} 충돌! (거리: {distance:.3f}m)")
+frame_start = bpy.context.scene.frame_start
+frame_end = bpy.context.scene.frame_end
+
+for frame in range(frame_start, frame_end + 1):
+    bpy.context.scene.frame_set(frame)
+    for i in range(len(drones)):
+        for j in range(i + 1, len(drones)):
+            pos1 = drones[i].matrix_world.translation
+            pos2 = drones[j].matrix_world.translation
+            distance = (pos1 - pos2).length
+            if distance < collision_threshold:
+                print(f"Frame {frame}: {drones[i].name}와 {drones[j].name} 충돌! (거리: {distance:.3f}m)")
